@@ -54,6 +54,8 @@ import {
   updateOrderStatus
 } from './lib/supabase';
 import { SupabaseConfigModal } from './components/SupabaseConfigModal';
+import { LocationMap } from './components/LocationMap';
+import { LatLng, geocodeAddress, getDevicePosition, routeDistanceKm, formatKm } from './lib/geo';
 import { 
   ValetDriver, 
   OwnerAccount, 
@@ -193,6 +195,9 @@ interface BusinessItem {
   valetPerKm: number;
   vipBaseFee: number;
   vipPerKm: number;
+  // Localização do lava-rápido no mapa (marcada pelo dono)
+  lat?: number;
+  lng?: number;
   activeCars: Array<{
     id: number;
     plate: string;
@@ -438,6 +443,13 @@ export default function App() {
   const [selectedServices, setSelectedServices] = useState<string[]>(['srv-1', 'srv-3']);
   const [fulfillmentType, setFulfillmentType] = useState<'patio' | 'valet' | 'vip'>('patio');
   const [distanceKm, setDistanceKm] = useState<number>(8);
+  // Distância calculada até o lava-rápido (a posição do cliente nunca é guardada)
+  const [distanceInfo, setDistanceInfo] = useState<{ km: number; byRoad: boolean } | null>(null);
+  const [clientAddressQuery, setClientAddressQuery] = useState<string>('');
+  const [clientGeoBusy, setClientGeoBusy] = useState<boolean>(false);
+  const [clientGeoError, setClientGeoError] = useState<string>('');
+  const [ownerGeoBusy, setOwnerGeoBusy] = useState<boolean>(false);
+  const [ownerGeoMsg, setOwnerGeoMsg] = useState<string>('');
 
   // Pedidos que aparecem no Pátio do dono
   const [patioOrders, setPatioOrders] = useState<ServiceOrder[]>([]);
@@ -496,6 +508,103 @@ export default function App() {
   // O estabelecimento do dono só é criado/atualizado ao confirmar (handleOwnerRegister /
   // handleSaveCredentials). Antes havia um efeito aqui que rodava a cada tecla digitada no
   // "Nome Fantasia" e criava um estabelecimento novo para cada prefixo ("L", "La", "Lav"...).
+
+  // ---------------------------------------------------------------------------
+  // LOCALIZAÇÃO DO LAVA-RÁPIDO E DISTÂNCIA DO LEVA E TRAZ
+  // ---------------------------------------------------------------------------
+  const businessPoint: LatLng | null =
+    typeof currentBusiness.lat === 'number' && typeof currentBusiness.lng === 'number'
+      ? { lat: currentBusiness.lat, lng: currentBusiness.lng }
+      : null;
+
+  // Trocou de lava-rápido: a distância precisa ser calculada de novo
+  useEffect(() => {
+    setDistanceInfo(null);
+    setClientGeoError('');
+  }, [currentBusiness.id, currentBusiness.lat, currentBusiness.lng]);
+
+  const handleSetBusinessLocation = (point: LatLng) => {
+    if (!selectedBusinessId) return;
+    setBusinesses(prev => {
+      const existing = prev[selectedBusinessId];
+      if (!existing) return prev;
+      const next = { ...prev, [selectedBusinessId]: { ...existing, lat: point.lat, lng: point.lng } };
+      localStorage.setItem(LOCAL_STORAGE_BUSINESS, JSON.stringify(next));
+      return next;
+    });
+    setOwnerGeoMsg('📍 Localização salva. Os clientes veem este ponto no mapa.');
+  };
+
+  const handleOwnerLocateByAddress = async () => {
+    const address = (ownerAccount.address || currentBusiness.address || '').trim();
+    if (!address || address === 'Endereço Comercial') {
+      setOwnerGeoMsg('Preencha o endereço comercial acima (rua, número, cidade).');
+      return;
+    }
+    setOwnerGeoBusy(true);
+    setOwnerGeoMsg('');
+    const found = await geocodeAddress(address);
+    setOwnerGeoBusy(false);
+    if (!found) {
+      setOwnerGeoMsg('Endereço não encontrado. Tente com cidade e estado, ou toque no mapa.');
+      return;
+    }
+    handleSetBusinessLocation(found);
+  };
+
+  const handleOwnerLocateByGps = async () => {
+    setOwnerGeoBusy(true);
+    setOwnerGeoMsg('');
+    try {
+      const pos = await getDevicePosition();
+      handleSetBusinessLocation(pos);
+    } catch (err) {
+      setOwnerGeoMsg(err instanceof Error ? err.message : 'Não foi possível obter a localização.');
+    }
+    setOwnerGeoBusy(false);
+  };
+
+  const applyClientDistance = async (from: LatLng) => {
+    if (!businessPoint) return;
+    const res = await routeDistanceKm(from, businessPoint);
+    const km = Math.max(0.1, Math.round(res.km * 10) / 10);
+    setDistanceKm(km);
+    setDistanceInfo({ km, byRoad: res.byRoad });
+  };
+
+  const handleClientDistanceByGps = async () => {
+    setClientGeoBusy(true);
+    setClientGeoError('');
+    try {
+      const pos = await getDevicePosition();
+      await applyClientDistance(pos);
+    } catch (err) {
+      setClientGeoError(err instanceof Error ? err.message : 'Não foi possível obter a localização.');
+    }
+    setClientGeoBusy(false);
+  };
+
+  const handleClientDistanceByAddress = async () => {
+    if (!clientAddressQuery.trim()) {
+      setClientGeoError('Digite seu endereço ou bairro e cidade.');
+      return;
+    }
+    setClientGeoBusy(true);
+    setClientGeoError('');
+    const found = await geocodeAddress(clientAddressQuery);
+    if (!found) {
+      setClientGeoError('Endereço não encontrado. Tente incluir a cidade.');
+    } else {
+      await applyClientDistance(found);
+    }
+    setClientGeoBusy(false);
+  };
+
+  const needsDistanceCalc = fulfillmentType !== 'patio' && !!businessPoint && !distanceInfo;
+  const tripFeeLabel = (base: number, perKm: number) =>
+    businessPoint && !distanceInfo
+      ? `R$ ${base.toFixed(2).replace('.', ',')} + R$ ${perKm.toFixed(2).replace('.', ',')}/km`
+      : `R$ ${(base + distanceKm * perKm).toFixed(2).replace('.', ',')}`;
 
   // Cálculos dinâmicos
   const currentCategory = useMemo(() => {
@@ -821,6 +930,11 @@ export default function App() {
   // WhatsApp do lava-rápido abre direto com o orçamento completo. O número do cliente
   // chega ao dono pela própria conversa do WhatsApp, por isso não pedimos nada aqui.
   const handleFinishWhatsApp = async () => {
+    if (needsDistanceCalc) {
+      showToast('📍 Calcule a distância até o lava-rápido para ver o valor do deslocamento.');
+      return;
+    }
+
     const providerPhone = normalizeBrPhone(currentBusiness.phone || '');
     if (!providerPhone) {
       showToast(`⚠️ ${currentBusiness.name} ainda não cadastrou o WhatsApp. Tente outro lava-rápido.`);
@@ -852,7 +966,7 @@ export default function App() {
       total_amount: grandTotal,
       customer_whatsapp: '',
       status: 'pendente',
-      notes: needsTrip ? `Distância: ${distanceKm} KM` : undefined,
+      notes: needsTrip ? `Distância: ${formatKm(distanceKm)} km${distanceInfo ? (distanceInfo.byRoad ? ' (calculada pela rua)' : ' (calculada)') : ' (informada pelo cliente)'}` : undefined,
     };
 
     let protocol = getOrderProtocol(`local-${Date.now()}`);
@@ -881,7 +995,7 @@ Olá, ${currentBusiness.name}! Montei este orçamento no app:
 📋 *Pedido:* #${protocol}
 🚘 *Veículo:* ${currentCategory.name}
 📍 *Atendimento:* ${fulfillmentLabel}
-${needsTrip ? `🛣️ *Distância aproximada:* ${distanceKm} KM\n` : ''}
+${needsTrip ? `🛣️ *Distância até o lava-rápido:* ${formatKm(distanceKm)} km${distanceInfo ? (distanceInfo.byRoad ? ' (calculada pela rua no app)' : ' (calculada no app)') : ' (aproximada)'}\n` : ''}
 *SERVIÇOS:*
 ${servicesText}
 ${needsTrip ? `Taxa de deslocamento: R$ ${deliveryFee.toFixed(2).replace('.', ',')}\n` : ''}
@@ -1479,6 +1593,36 @@ Qual o melhor dia e horário?${needsTrip ? ' Te passo o endereço por aqui.' : '
                               placeholder="Rua, Número, Bairro, Cidade"
                               className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-2.5 py-1.5 text-white text-[11px] focus:outline-none focus:border-blue-500"
                             />
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <label className="text-[10px] font-semibold text-zinc-400 block">Localização do lava-rápido no mapa:</label>
+                            <div className="grid grid-cols-2 gap-1.5">
+                              <button
+                                type="button"
+                                disabled={ownerGeoBusy}
+                                onClick={handleOwnerLocateByAddress}
+                                className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-bold py-1.5 rounded-lg text-[10px] cursor-pointer disabled:opacity-50"
+                              >
+                                🔎 Buscar pelo endereço
+                              </button>
+                              <button
+                                type="button"
+                                disabled={ownerGeoBusy}
+                                onClick={handleOwnerLocateByGps}
+                                className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-bold py-1.5 rounded-lg text-[10px] cursor-pointer disabled:opacity-50"
+                              >
+                                📍 Estou no lava-rápido agora
+                              </button>
+                            </div>
+                            <LocationMap point={businessPoint} label={currentBusiness.name} onPick={handleSetBusinessLocation} height={170} />
+                            <p className="text-[10px] text-zinc-500">
+                              {ownerGeoBusy
+                                ? 'Localizando...'
+                                : ownerGeoMsg || (businessPoint
+                                  ? 'Arraste o pino ou toque no mapa para ajustar. Os clientes usam este ponto para calcular a distância do Leva e Traz.'
+                                  : 'Marque onde fica o lava-rápido para os clientes calcularem a distância do Leva e Traz.')}
+                            </p>
                           </div>
                         </div>
 
@@ -2203,7 +2347,7 @@ Qual o melhor dia e horário?${needsTrip ? ' Te passo o endereço por aqui.' : '
                       </div>
                     </div>
                     <span className="text-[10px] font-bold text-emerald-400 font-mono">
-                      R$ {(currentBusiness.valetBaseFee + distanceKm * currentBusiness.valetPerKm).toFixed(2).replace('.', ',')}
+                      {tripFeeLabel(currentBusiness.valetBaseFee, currentBusiness.valetPerKm)}
                     </span>
                   </div>
 
@@ -2237,29 +2381,84 @@ Qual o melhor dia e horário?${needsTrip ? ' Te passo o endereço por aqui.' : '
                         </div>
                       </div>
                       <span className={`text-[10px] font-bold font-mono ${currentBusiness.hasVip ? 'text-amber-400' : 'text-zinc-600'}`}>
-                        {currentBusiness.hasVip ? `R$ ${(currentBusiness.vipBaseFee + distanceKm * currentBusiness.vipPerKm).toFixed(2).replace('.', ',')}` : 'Bloqueado'}
+                        {currentBusiness.hasVip ? tripFeeLabel(currentBusiness.vipBaseFee, currentBusiness.vipPerKm) : 'Bloqueado'}
                       </span>
                     </div>
                   </div>
 
                 </div>
 
-                {/* SLIDER DE DISTÂNCIA KM */}
+                {/* DISTÂNCIA ATÉ O LAVA-RÁPIDO */}
                 {fulfillmentType !== 'patio' && (
-                  <div className="mt-3 p-3 bg-zinc-900 rounded-xl border border-zinc-800 space-y-1.5">
-                    <div className="flex justify-between items-center text-xs">
-                      <span className="text-zinc-400">Distância do atendimento:</span>
-                      <span className="font-bold text-emerald-400 font-mono">{distanceKm} KM</span>
+                  businessPoint ? (
+                    <div className="mt-3 p-3 bg-zinc-900 rounded-xl border border-zinc-800 space-y-2">
+                      <div className="text-xs text-zinc-300 font-bold">📍 Onde fica o {currentBusiness.name}</div>
+                      <LocationMap point={businessPoint} label={currentBusiness.name} height={150} />
+                      {distanceInfo ? (
+                        <div className="flex items-center justify-between text-xs bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-2.5 py-2">
+                          <span className="text-zinc-200">
+                            O lava-rápido fica a <strong className="text-emerald-400">{formatKm(distanceInfo.km)} km</strong> de você{distanceInfo.byRoad ? ' (pela rua)' : ''}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setDistanceInfo(null)}
+                            className="text-[10px] text-zinc-400 hover:text-white cursor-pointer shrink-0 ml-2"
+                          >
+                            Recalcular
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="space-y-1.5">
+                          <button
+                            type="button"
+                            disabled={clientGeoBusy}
+                            onClick={handleClientDistanceByGps}
+                            className="w-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-2 rounded-lg text-[11px] cursor-pointer disabled:opacity-50"
+                          >
+                            {clientGeoBusy ? 'Calculando...' : '📍 Calcular distância pela minha localização'}
+                          </button>
+                          <div className="flex gap-1.5">
+                            <input
+                              type="text"
+                              placeholder="Ou digite seu endereço / bairro e cidade"
+                              value={clientAddressQuery}
+                              onChange={(e) => setClientAddressQuery(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') handleClientDistanceByAddress(); }}
+                              className="flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-2.5 py-1.5 text-[11px] text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
+                            />
+                            <button
+                              type="button"
+                              disabled={clientGeoBusy}
+                              onClick={handleClientDistanceByAddress}
+                              className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-bold px-3 rounded-lg text-[11px] cursor-pointer disabled:opacity-50"
+                            >
+                              Calcular
+                            </button>
+                          </div>
+                          {clientGeoError && <div className="text-[10px] text-red-400">{clientGeoError}</div>}
+                        </div>
+                      )}
+                      <p className="text-[10px] text-zinc-500">
+                        🔒 Sua localização é usada só neste celular para calcular a distância. Ela não é salva nem enviada ao lava-rápido.
+                      </p>
                     </div>
-                    <input
-                      type="range"
-                      min="1"
-                      max="30"
-                      value={distanceKm}
-                      onChange={(e) => setDistanceKm(Number(e.target.value))}
-                      className="w-full accent-emerald-500 bg-zinc-950 h-1.5 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
+                  ) : (
+                    <div className="mt-3 p-3 bg-zinc-900 rounded-xl border border-zinc-800 space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="text-zinc-400">Distância aproximada:</span>
+                        <span className="font-bold text-emerald-400 font-mono">{distanceKm} KM</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="30"
+                        value={distanceKm}
+                        onChange={(e) => setDistanceKm(Number(e.target.value))}
+                        className="w-full accent-emerald-500 bg-zinc-950 h-1.5 rounded-lg appearance-none cursor-pointer"
+                      />
+                      <p className="text-[10px] text-zinc-500">Este lava-rápido ainda não marcou a localização no mapa.</p>
+                    </div>
+                  )
                 )}
               </div>
 
