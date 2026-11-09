@@ -826,9 +826,7 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
         {/* BARRA SUPERIOR DO APLICATIVO */}
         <header className="bg-[#161619] border-b border-zinc-800 p-3.5 flex items-center justify-between sticky top-0 z-30">
           <div className="flex items-center space-x-2">
-            <div className="w-8 h-8 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-black">
-              💦
-            </div>
+            <img src="/icon.svg" alt="Jato Splash Car" className="w-8 h-8 rounded-xl" />
             <div>
               <h1 className="font-extrabold text-xs tracking-wider text-white">JATO SPLASH CAR</h1>
               <p className="text-[9px] text-zinc-500">{currentBusiness.name}</p>
@@ -862,9 +860,7 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
         {currentMode === 'welcome' && (
           <div className="p-5 flex-1 flex flex-col justify-center space-y-6 animate-fadeIn">
             <div className="text-center space-y-2">
-              <div className="w-14 h-14 bg-emerald-500/10 border border-emerald-500/30 rounded-3xl flex items-center justify-center mx-auto text-2xl">
-                🧼
-              </div>
+              <img src="/logo.png" alt="Jato Splash Car - Lava Jato e Estética Automotiva" className="w-56 mx-auto" />
               <h2 className="text-base font-bold text-white">Como deseja acessar hoje?</h2>
               <p className="text-xs text-zinc-400 max-w-xs mx-auto">
                 Selecione seu perfil. Cada perfil possui acesso específico às ferramentas do sistema.
