@@ -1,0 +1,6 @@
+{
+  "name": "Jato Splash Car - Agendamento & OS",
+  "description": "Aplicativo profissional de agendamento de lavagem e estética automotiva Jato Splash Car integrado ao Supabase, com suporte a Pátio, Valet e Unidade Móvel VIP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
