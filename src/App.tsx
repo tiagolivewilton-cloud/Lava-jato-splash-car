@@ -205,6 +205,24 @@ export default function App() {
     if (savedOwner) {
       try {
         const owner = JSON.parse(savedOwner);
+
+        // Limpeza dos duplicados criados pelo bug antigo (um estabelecimento por letra digitada).
+        // Estabelecimentos que vieram do Supabase têm id UUID real e nunca são removidos aqui.
+        // Dos criados só neste navegador (id "uuid-..."), mantém apenas o do dono.
+        const ownerSlugKey = owner.fantasyName?.trim()
+          ? 'biz-' + owner.fantasyName.trim().toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')
+          : '';
+        const keepKey = owner.businessId && loaded[owner.businessId] ? owner.businessId : ownerSlugKey;
+        if (keepKey && loaded[keepKey]) {
+          Object.keys(loaded).forEach((key) => {
+            const isLocalOnly = String(loaded[key]?.id || '').startsWith('uuid-');
+            if (isLocalOnly && key !== keepKey) {
+              delete loaded[key];
+            }
+          });
+          localStorage.setItem(LOCAL_STORAGE_BUSINESS, JSON.stringify(loaded));
+        }
+
         if (owner.fantasyName && owner.fantasyName.trim() && !owner.fantasyName.includes('Auto Spa')) {
           const fantasy = owner.fantasyName.trim();
           const bizKey = owner.businessId || ('biz-' + fantasy.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-'));
@@ -371,44 +389,9 @@ export default function App() {
     syncSupabase();
   }, [syncSupabase]);
 
-  // Garante que o estabelecimento real criado pelo dono apareça na lista de estabelecimentos
-  useEffect(() => {
-    if (ownerAccount.fantasyName && ownerAccount.fantasyName.trim() && !ownerAccount.fantasyName.includes('Auto Spa')) {
-      const fantasy = ownerAccount.fantasyName.trim();
-      const bizKey = ownerAccount.businessId || ('biz-' + fantasy.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-'));
-
-      setBusinesses(prev => {
-        if (!prev[bizKey] || prev[bizKey].name !== fantasy) {
-          const next = {
-            ...prev,
-            [bizKey]: {
-              id: prev[bizKey]?.id || `uuid-${Date.now()}`,
-              name: fantasy,
-              phone: ownerAccount.phone?.trim() || '(15) 99999-8888',
-              address: ownerAccount.address?.trim() || 'Endereço Comercial',
-              hours: 'Seg a Sáb: 08h às 18h',
-              pixKey: ownerAccount.cnpjCpf?.trim() || ownerAccount.phone?.trim() || 'PIX',
-              hasVip: prev[bizKey]?.hasVip ?? true,
-              queueCount: prev[bizKey]?.queueCount ?? 0,
-              status: prev[bizKey]?.status || 'Disponível',
-              statusColor: prev[bizKey]?.statusColor || 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-              estimatedWait: prev[bizKey]?.estimatedWait || '~0 min',
-              valetBaseFee: prev[bizKey]?.valetBaseFee ?? 15,
-              valetPerKm: prev[bizKey]?.valetPerKm ?? 3.5,
-              vipBaseFee: prev[bizKey]?.vipBaseFee ?? 40,
-              vipPerKm: prev[bizKey]?.vipPerKm ?? 4.0,
-              activeCars: prev[bizKey]?.activeCars || []
-            }
-          };
-          localStorage.setItem(LOCAL_STORAGE_BUSINESS, JSON.stringify(next));
-          return next;
-        }
-        return prev;
-      });
-
-      setSelectedBusinessId(bizKey);
-    }
-  }, [ownerAccount.fantasyName, ownerAccount.businessId]);
+  // O estabelecimento do dono só é criado/atualizado ao confirmar (handleOwnerRegister /
+  // handleSaveCredentials). Antes havia um efeito aqui que rodava a cada tecla digitada no
+  // "Nome Fantasia" e criava um estabelecimento novo para cada prefixo ("L", "La", "Lav"...).
 
   // Cálculos dinâmicos
   const currentCategory = useMemo(() => {
