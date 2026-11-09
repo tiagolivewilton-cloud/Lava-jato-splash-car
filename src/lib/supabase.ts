@@ -291,15 +291,20 @@ export async function fetchServiceOrders(businessId?: string): Promise<{
     }
     const { data, error } = await query;
 
+    // Pedidos que não conseguiram ir para o Supabase ficam salvos neste aparelho
+    const localOrders = getLocalOrders().filter((o) => !businessId || o.business_id === businessId);
+
     if (error) {
-      const localOrders = getLocalOrders();
       return { orders: localOrders, isLive: false, error: error.message };
     }
 
-    return { orders: (data as ServiceOrder[]) || [], isLive: true };
+    const merged = [...((data as ServiceOrder[]) || []), ...localOrders].sort((a, b) =>
+      (b.created_at || '').localeCompare(a.created_at || '')
+    );
+    return { orders: merged, isLive: true };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Erro de consulta';
-    const localOrders = getLocalOrders();
+    const localOrders = getLocalOrders().filter((o) => !businessId || o.business_id === businessId);
     return { orders: localOrders, isLive: false, error: msg };
   }
 }

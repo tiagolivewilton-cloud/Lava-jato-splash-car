@@ -49,14 +49,119 @@ import {
 import { 
   fetchBusinesses, 
   insertServiceOrder, 
-  updateBusinessVipUnit 
+  updateBusinessVipUnit,
+  fetchServiceOrders,
+  updateOrderStatus
 } from './lib/supabase';
 import { SupabaseConfigModal } from './components/SupabaseConfigModal';
+import { LocationMap } from './components/LocationMap';
+import { LatLng, geocodeAddress, getDevicePosition, routeDistanceKm, formatKm } from './lib/geo';
 import { 
   ValetDriver, 
   OwnerAccount, 
-  FreelancerProfile 
+  FreelancerProfile,
+  ServiceOrder,
+  OrderStatus
 } from './types';
+
+// Protocolo curto e legível do pedido (ex: #A1B2C3)
+const getOrderProtocol = (id?: string) => {
+  if (!id) return '------';
+  const clean = id.replace(/^local-/, '').replace(/[^a-zA-Z0-9]/g, '');
+  return clean.slice(-6).toUpperCase();
+};
+
+// Telefone brasileiro: DDD + 8 ou 9 dígitos, com ou sem +55
+const normalizeBrPhone = (value: string): string | null => {
+  let digits = (value || '').replace(/\D/g, '');
+  if ((digits.length === 12 || digits.length === 13) && digits.startsWith('55')) {
+    digits = digits.slice(2);
+  }
+  if (digits.length !== 10 && digits.length !== 11) return null;
+  return digits;
+};
+
+const ORDER_STATUS_LABEL: Record<OrderStatus, string> = {
+  pendente: 'Novo pedido',
+  confirmado: 'Confirmado',
+  em_andamento: 'Em andamento',
+  concluido: 'Pronto',
+  cancelado: 'Cancelado',
+};
+
+const ORDER_STATUS_STYLE: Record<OrderStatus, string> = {
+  pendente: 'bg-blue-500/10 text-blue-400 border-blue-500/30',
+  confirmado: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
+  em_andamento: 'bg-purple-500/10 text-purple-300 border-purple-500/30',
+  concluido: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
+  cancelado: 'bg-zinc-800 text-zinc-500 border-zinc-700',
+};
+
+const FULFILLMENT_LABEL: Record<string, string> = {
+  patio: 'Pátio',
+  valet: 'Leva e traz',
+  vip_mobile: 'VIP no local',
+};
+
+// Respostas rápidas que o dono manda ao cliente com um toque
+interface QuickReply {
+  id: string;
+  label: string;
+  status: OrderStatus;
+  onlyFor?: string[];
+  text: (bizName: string, protocol: string) => string;
+}
+
+const QUICK_REPLIES: QuickReply[] = [
+  {
+    id: 'confirmado',
+    label: '✅ Pedido confirmado',
+    status: 'confirmado',
+    text: (biz, prot) => `Olá! Aqui é do *${biz}*. Seu pedido #${prot} está confirmado. Qualquer dúvida é só chamar por aqui. 🚗✨`,
+  },
+  {
+    id: 'buscando',
+    label: '🚙 Estou indo buscar',
+    status: 'em_andamento',
+    onlyFor: ['valet'],
+    text: (biz, prot) => `Olá! Aqui é do *${biz}*. Nosso motorista está indo buscar seu veículo agora (pedido #${prot}).`,
+  },
+  {
+    id: 'a_caminho_vip',
+    label: '👑 Estou a caminho',
+    status: 'em_andamento',
+    onlyFor: ['vip_mobile'],
+    text: (biz, prot) => `Olá! Aqui é do *${biz}*. Nossa equipe está a caminho do seu endereço para a lavagem (pedido #${prot}).`,
+  },
+  {
+    id: 'lavando',
+    label: '🧽 Começamos a lavagem',
+    status: 'em_andamento',
+    onlyFor: ['patio', 'valet'],
+    text: (biz, prot) => `Olá! Aqui é do *${biz}*. Seu veículo já está em lavagem (pedido #${prot}). Avisamos assim que ficar pronto.`,
+  },
+  {
+    id: 'pronto_retirar',
+    label: '🏁 Pronto, pode vir retirar',
+    status: 'concluido',
+    onlyFor: ['patio'],
+    text: (biz, prot) => `Olá! Aqui é do *${biz}*. Seu veículo está *PRONTO*! Já pode vir retirar no pátio. (pedido #${prot}) Obrigado pela preferência! 🚗✨`,
+  },
+  {
+    id: 'pronto_levando',
+    label: '🏁 Pronto, estou indo levar',
+    status: 'concluido',
+    onlyFor: ['valet'],
+    text: (biz, prot) => `Olá! Aqui é do *${biz}*. Seu veículo está *PRONTO* e nosso motorista já está indo levar até você. (pedido #${prot}) Obrigado pela preferência! 🚗✨`,
+  },
+  {
+    id: 'pronto_vip',
+    label: '🏁 Lavagem concluída',
+    status: 'concluido',
+    onlyFor: ['vip_mobile'],
+    text: (biz, prot) => `Olá! Aqui é do *${biz}*. A lavagem do seu veículo foi *concluída*! (pedido #${prot}) Obrigado pela preferência! 🚗✨`,
+  },
+];
 
 interface ServiceItemDef {
   id: string;
@@ -90,6 +195,9 @@ interface BusinessItem {
   valetPerKm: number;
   vipBaseFee: number;
   vipPerKm: number;
+  // Localização do lava-rápido no mapa (marcada pelo dono)
+  lat?: number;
+  lng?: number;
   activeCars: Array<{
     id: number;
     plate: string;
@@ -205,6 +313,24 @@ export default function App() {
     if (savedOwner) {
       try {
         const owner = JSON.parse(savedOwner);
+
+        // Limpeza dos duplicados criados pelo bug antigo (um estabelecimento por letra digitada).
+        // Estabelecimentos que vieram do Supabase têm id UUID real e nunca são removidos aqui.
+        // Dos criados só neste navegador (id "uuid-..."), mantém apenas o do dono.
+        const ownerSlugKey = owner.fantasyName?.trim()
+          ? 'biz-' + owner.fantasyName.trim().toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')
+          : '';
+        const keepKey = owner.businessId && loaded[owner.businessId] ? owner.businessId : ownerSlugKey;
+        if (keepKey && loaded[keepKey]) {
+          Object.keys(loaded).forEach((key) => {
+            const isLocalOnly = String(loaded[key]?.id || '').startsWith('uuid-');
+            if (isLocalOnly && key !== keepKey) {
+              delete loaded[key];
+            }
+          });
+          localStorage.setItem(LOCAL_STORAGE_BUSINESS, JSON.stringify(loaded));
+        }
+
         if (owner.fantasyName && owner.fantasyName.trim() && !owner.fantasyName.includes('Auto Spa')) {
           const fantasy = owner.fantasyName.trim();
           const bizKey = owner.businessId || ('biz-' + fantasy.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-'));
@@ -317,9 +443,17 @@ export default function App() {
   const [selectedServices, setSelectedServices] = useState<string[]>(['srv-1', 'srv-3']);
   const [fulfillmentType, setFulfillmentType] = useState<'patio' | 'valet' | 'vip'>('patio');
   const [distanceKm, setDistanceKm] = useState<number>(8);
-  const [showModalWhatsApp, setShowModalWhatsApp] = useState<boolean>(false);
-  const [whatsappPhone, setWhatsappPhone] = useState<string>('');
-  const [customerName, setCustomerName] = useState<string>('');
+  // Distância calculada até o lava-rápido (a posição do cliente nunca é guardada)
+  const [distanceInfo, setDistanceInfo] = useState<{ km: number; byRoad: boolean } | null>(null);
+  const [clientAddressQuery, setClientAddressQuery] = useState<string>('');
+  const [clientGeoBusy, setClientGeoBusy] = useState<boolean>(false);
+  const [clientGeoError, setClientGeoError] = useState<string>('');
+  const [ownerGeoBusy, setOwnerGeoBusy] = useState<boolean>(false);
+  const [ownerGeoMsg, setOwnerGeoMsg] = useState<string>('');
+
+  // Pedidos que aparecem no Pátio do dono
+  const [patioOrders, setPatioOrders] = useState<ServiceOrder[]>([]);
+  const [patioLoading, setPatioLoading] = useState<boolean>(false);
 
   // ---------------------------------------------------------------------------
   // 7. MURAL DE DIÁRIAS (FREELANCER)
@@ -371,44 +505,106 @@ export default function App() {
     syncSupabase();
   }, [syncSupabase]);
 
-  // Garante que o estabelecimento real criado pelo dono apareça na lista de estabelecimentos
+  // O estabelecimento do dono só é criado/atualizado ao confirmar (handleOwnerRegister /
+  // handleSaveCredentials). Antes havia um efeito aqui que rodava a cada tecla digitada no
+  // "Nome Fantasia" e criava um estabelecimento novo para cada prefixo ("L", "La", "Lav"...).
+
+  // ---------------------------------------------------------------------------
+  // LOCALIZAÇÃO DO LAVA-RÁPIDO E DISTÂNCIA DO LEVA E TRAZ
+  // ---------------------------------------------------------------------------
+  const businessPoint: LatLng | null =
+    typeof currentBusiness.lat === 'number' && typeof currentBusiness.lng === 'number'
+      ? { lat: currentBusiness.lat, lng: currentBusiness.lng }
+      : null;
+
+  // Trocou de lava-rápido: a distância precisa ser calculada de novo
   useEffect(() => {
-    if (ownerAccount.fantasyName && ownerAccount.fantasyName.trim() && !ownerAccount.fantasyName.includes('Auto Spa')) {
-      const fantasy = ownerAccount.fantasyName.trim();
-      const bizKey = ownerAccount.businessId || ('biz-' + fantasy.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-'));
+    setDistanceInfo(null);
+    setClientGeoError('');
+  }, [currentBusiness.id, currentBusiness.lat, currentBusiness.lng]);
 
-      setBusinesses(prev => {
-        if (!prev[bizKey] || prev[bizKey].name !== fantasy) {
-          const next = {
-            ...prev,
-            [bizKey]: {
-              id: prev[bizKey]?.id || `uuid-${Date.now()}`,
-              name: fantasy,
-              phone: ownerAccount.phone?.trim() || '(15) 99999-8888',
-              address: ownerAccount.address?.trim() || 'Endereço Comercial',
-              hours: 'Seg a Sáb: 08h às 18h',
-              pixKey: ownerAccount.cnpjCpf?.trim() || ownerAccount.phone?.trim() || 'PIX',
-              hasVip: prev[bizKey]?.hasVip ?? true,
-              queueCount: prev[bizKey]?.queueCount ?? 0,
-              status: prev[bizKey]?.status || 'Disponível',
-              statusColor: prev[bizKey]?.statusColor || 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-              estimatedWait: prev[bizKey]?.estimatedWait || '~0 min',
-              valetBaseFee: prev[bizKey]?.valetBaseFee ?? 15,
-              valetPerKm: prev[bizKey]?.valetPerKm ?? 3.5,
-              vipBaseFee: prev[bizKey]?.vipBaseFee ?? 40,
-              vipPerKm: prev[bizKey]?.vipPerKm ?? 4.0,
-              activeCars: prev[bizKey]?.activeCars || []
-            }
-          };
-          localStorage.setItem(LOCAL_STORAGE_BUSINESS, JSON.stringify(next));
-          return next;
-        }
-        return prev;
-      });
+  const handleSetBusinessLocation = (point: LatLng) => {
+    if (!selectedBusinessId) return;
+    setBusinesses(prev => {
+      const existing = prev[selectedBusinessId];
+      if (!existing) return prev;
+      const next = { ...prev, [selectedBusinessId]: { ...existing, lat: point.lat, lng: point.lng } };
+      localStorage.setItem(LOCAL_STORAGE_BUSINESS, JSON.stringify(next));
+      return next;
+    });
+    setOwnerGeoMsg('📍 Localização salva. Os clientes veem este ponto no mapa.');
+  };
 
-      setSelectedBusinessId(bizKey);
+  const handleOwnerLocateByAddress = async () => {
+    const address = (ownerAccount.address || currentBusiness.address || '').trim();
+    if (!address || address === 'Endereço Comercial') {
+      setOwnerGeoMsg('Preencha o endereço comercial acima (rua, número, cidade).');
+      return;
     }
-  }, [ownerAccount.fantasyName, ownerAccount.businessId]);
+    setOwnerGeoBusy(true);
+    setOwnerGeoMsg('');
+    const found = await geocodeAddress(address);
+    setOwnerGeoBusy(false);
+    if (!found) {
+      setOwnerGeoMsg('Endereço não encontrado. Tente com cidade e estado, ou toque no mapa.');
+      return;
+    }
+    handleSetBusinessLocation(found);
+  };
+
+  const handleOwnerLocateByGps = async () => {
+    setOwnerGeoBusy(true);
+    setOwnerGeoMsg('');
+    try {
+      const pos = await getDevicePosition();
+      handleSetBusinessLocation(pos);
+    } catch (err) {
+      setOwnerGeoMsg(err instanceof Error ? err.message : 'Não foi possível obter a localização.');
+    }
+    setOwnerGeoBusy(false);
+  };
+
+  const applyClientDistance = async (from: LatLng) => {
+    if (!businessPoint) return;
+    const res = await routeDistanceKm(from, businessPoint);
+    const km = Math.max(0.1, Math.round(res.km * 10) / 10);
+    setDistanceKm(km);
+    setDistanceInfo({ km, byRoad: res.byRoad });
+  };
+
+  const handleClientDistanceByGps = async () => {
+    setClientGeoBusy(true);
+    setClientGeoError('');
+    try {
+      const pos = await getDevicePosition();
+      await applyClientDistance(pos);
+    } catch (err) {
+      setClientGeoError(err instanceof Error ? err.message : 'Não foi possível obter a localização.');
+    }
+    setClientGeoBusy(false);
+  };
+
+  const handleClientDistanceByAddress = async () => {
+    if (!clientAddressQuery.trim()) {
+      setClientGeoError('Digite seu endereço ou bairro e cidade.');
+      return;
+    }
+    setClientGeoBusy(true);
+    setClientGeoError('');
+    const found = await geocodeAddress(clientAddressQuery);
+    if (!found) {
+      setClientGeoError('Endereço não encontrado. Tente incluir a cidade.');
+    } else {
+      await applyClientDistance(found);
+    }
+    setClientGeoBusy(false);
+  };
+
+  const needsDistanceCalc = fulfillmentType !== 'patio' && !!businessPoint && !distanceInfo;
+  const tripFeeLabel = (base: number, perKm: number) =>
+    businessPoint && !distanceInfo
+      ? `R$ ${base.toFixed(2).replace('.', ',')} + R$ ${perKm.toFixed(2).replace('.', ',')}/km`
+      : `R$ ${(base + distanceKm * perKm).toFixed(2).replace('.', ',')}`;
 
   // Cálculos dinâmicos
   const currentCategory = useMemo(() => {
@@ -730,9 +926,26 @@ export default function App() {
     }
   };
 
-  const handleFinishWhatsApp = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!whatsappPhone) return;
+  // O cliente toca em "Confirmar agendamento no WhatsApp": o pedido é registrado e o
+  // WhatsApp do lava-rápido abre direto com o orçamento completo. O número do cliente
+  // chega ao dono pela própria conversa do WhatsApp, por isso não pedimos nada aqui.
+  const handleFinishWhatsApp = async () => {
+    if (needsDistanceCalc) {
+      showToast('📍 Calcule a distância até o lava-rápido para ver o valor do deslocamento.');
+      return;
+    }
+
+    const providerPhone = normalizeBrPhone(currentBusiness.phone || '');
+    if (!providerPhone) {
+      showToast(`⚠️ ${currentBusiness.name} ainda não cadastrou o WhatsApp. Tente outro lava-rápido.`);
+      return;
+    }
+
+    // Abre a janela já no clique (evita bloqueio de pop-up) e preenche o link depois
+    let waWindow: Window | null = null;
+    try {
+      waWindow = window.open('', '_blank');
+    } catch {}
 
     const selectedServiceObjects = selectedServices.map((id) => {
       const srv = servicesList.find((s) => s.id === id);
@@ -744,69 +957,110 @@ export default function App() {
       };
     });
 
+    const needsTrip = fulfillmentType !== 'patio';
     const orderPayload = {
       business_id: currentBusiness.id,
       vehicle_category: selectedCategory,
       services: selectedServiceObjects,
       fulfillment_type: fulfillmentType === 'vip' ? 'vip_mobile' : fulfillmentType,
       total_amount: grandTotal,
-      customer_whatsapp: whatsappPhone,
+      customer_whatsapp: '',
       status: 'pendente',
-      customer_name: customerName || 'Cliente Anônimo',
-      notes: `Distância: ${distanceKm} KM`,
+      notes: needsTrip ? `Distância: ${formatKm(distanceKm)} km${distanceInfo ? (distanceInfo.byRoad ? ' (calculada pela rua)' : ' (calculada)') : ' (informada pelo cliente)'}` : undefined,
     };
 
-    let protocol = 'OS-' + Math.random().toString(36).substring(2, 8).toUpperCase();
-
+    let protocol = getOrderProtocol(`local-${Date.now()}`);
     try {
       const res = await insertServiceOrder(orderPayload);
       if (res.data?.id) {
-        protocol = res.data.id.slice(0, 8).toUpperCase();
+        protocol = getOrderProtocol(res.data.id);
       }
     } catch {}
 
-    // Identifica se há motorista valet da equipe para mencionar
-    const assignedValet = valetDrivers.find(d => d.status === 'ativo') || valetDrivers[0];
-
     const fulfillmentLabel =
       fulfillmentType === 'vip'
-        ? '👑 OS VIP (Lavagem no Seu Local)'
+        ? '👑 VIP (lavagem no meu endereço)'
         : fulfillmentType === 'valet'
-        ? `🚙 Valet Leva e Traz (Motorista da Equipe: ${assignedValet ? assignedValet.name : 'Credenciado'})`
-        : '🏢 Atendimento no Pátio Fixo';
+        ? '🚙 Leva e traz (buscar e devolver o carro)'
+        : '🏢 Levo o carro até o pátio';
 
     const servicesText = selectedServiceObjects
       .map((s) => `  • ${s.name} (R$ ${s.price.toFixed(2).replace('.', ',')})`)
       .join('\n');
 
-    const message = 
-`*NOVO AGENDAMENTO - JATO SPLASH CAR* 🚗✨
------------------------------------------
-📋 *Protocolo da OS:* #${protocol}
-🏢 *Lava-Rápido:* ${currentBusiness.name}
-📍 *Modalidade:* ${fulfillmentLabel}
-${fulfillmentType !== 'patio' ? `🛣️ *Distância:* ${distanceKm} KM\n` : ''}
-🚘 *Veículo:* ${currentCategory.name} (Fator: ${currentCategory.multiplier}x)
+    const message =
+`*PEDIDO DE LAVAGEM - JATO SPLASH CAR* 🚗✨
+Olá, ${currentBusiness.name}! Montei este orçamento no app:
 
-*SERVIÇOS SOLICITADOS:*
+📋 *Pedido:* #${protocol}
+🚘 *Veículo:* ${currentCategory.name}
+📍 *Atendimento:* ${fulfillmentLabel}
+${needsTrip ? `🛣️ *Distância até o lava-rápido:* ${formatKm(distanceKm)} km${distanceInfo ? (distanceInfo.byRoad ? ' (calculada pela rua no app)' : ' (calculada no app)') : ' (aproximada)'}\n` : ''}
+*SERVIÇOS:*
 ${servicesText}
-${fulfillmentType !== 'patio' ? `Taxa Deslocamento: R$ ${deliveryFee.toFixed(2).replace('.', ',')}\n` : ''}
-💰 *VALOR TOTAL:* R$ ${grandTotal.toFixed(2).replace('.', ',')}
-👤 *Cliente:* ${customerName || 'Não informado'}
-📱 *WhatsApp:* ${whatsappPhone}
------------------------------------------
-_Ordem gerada pelo aplicativo Jato Splash Car._`;
+${needsTrip ? `Taxa de deslocamento: R$ ${deliveryFee.toFixed(2).replace('.', ',')}\n` : ''}
+💰 *TOTAL ESTIMADO:* R$ ${grandTotal.toFixed(2).replace('.', ',')}
 
-    const cleanProviderPhone = currentBusiness.phone.replace(/\D/g, '');
-    const targetPhone = cleanProviderPhone.length >= 10 ? `55${cleanProviderPhone}` : '5515998765432';
-    const waLink = `https://wa.me/${targetPhone}?text=${encodeURIComponent(message)}`;
+Qual o melhor dia e horário?${needsTrip ? ' Te passo o endereço por aqui.' : ''}`;
 
+    const waLink = `https://wa.me/55${providerPhone}?text=${encodeURIComponent(message)}`;
+    if (waWindow) {
+      waWindow.location.href = waLink;
+    } else {
+      window.location.href = waLink;
+    }
+
+    showToast(`✅ Pedido #${protocol} enviado para o WhatsApp de ${currentBusiness.name}!`);
+  };
+
+  // ---------------------------------------------------------------------------
+  // PÁTIO DO DONO: PEDIDOS, STATUS E RESPOSTAS RÁPIDAS
+  // ---------------------------------------------------------------------------
+  const loadPatioOrders = useCallback(async () => {
+    if (!currentBusiness.id) {
+      setPatioOrders([]);
+      return;
+    }
+    setPatioLoading(true);
     try {
-      window.open(waLink, '_blank');
-    } catch {}
+      const res = await fetchServiceOrders(currentBusiness.id);
+      setPatioOrders(res.orders);
+    } catch {
+      setPatioOrders([]);
+    }
+    setPatioLoading(false);
+  }, [currentBusiness.id]);
 
-    setShowModalWhatsApp(false);
-    showToast(`✅ OS #${protocol} gerada no Supabase e enviada para ${currentBusiness.name}!`);
+  useEffect(() => {
+    if (currentMode === 'owner' && ownerSubTab === 'patio') {
+      loadPatioOrders();
+    }
+  }, [currentMode, ownerSubTab, loadPatioOrders]);
+
+  const handleChangeOrderStatus = async (order: ServiceOrder, status: OrderStatus) => {
+    if (!order.id) return false;
+    const res = await updateOrderStatus(order.id, status);
+    if (!res.success) {
+      showToast(`⚠️ Não foi possível atualizar o pedido: ${res.error || 'erro desconhecido'}`);
+      return false;
+    }
+    setPatioOrders(prev => prev.map(o => (o.id === order.id ? { ...o, status } : o)));
+    return true;
+  };
+
+  // Abre o WhatsApp com a mensagem pronta. Sem o número do cliente salvo, o WhatsApp
+  // abre a lista de conversas para o dono escolher a do cliente (a do pedido).
+  const handleQuickReply = (order: ServiceOrder, reply: QuickReply) => {
+    const text = reply.text(currentBusiness.name, getOrderProtocol(order.id));
+    const phone = normalizeBrPhone(order.customer_whatsapp || '');
+    const link = phone
+      ? `https://wa.me/55${phone}?text=${encodeURIComponent(text)}`
+      : `https://wa.me/?text=${encodeURIComponent(text)}`;
+    try {
+      window.open(link, '_blank');
+    } catch {}
+    handleChangeOrderStatus(order, reply.status);
+    showToast(`Pedido #${getOrderProtocol(order.id)}: ${ORDER_STATUS_LABEL[reply.status]}`);
   };
 
   return (
@@ -1340,6 +1594,36 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
                               className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-2.5 py-1.5 text-white text-[11px] focus:outline-none focus:border-blue-500"
                             />
                           </div>
+
+                          <div className="space-y-1.5">
+                            <label className="text-[10px] font-semibold text-zinc-400 block">Localização do lava-rápido no mapa:</label>
+                            <div className="grid grid-cols-2 gap-1.5">
+                              <button
+                                type="button"
+                                disabled={ownerGeoBusy}
+                                onClick={handleOwnerLocateByAddress}
+                                className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-bold py-1.5 rounded-lg text-[10px] cursor-pointer disabled:opacity-50"
+                              >
+                                🔎 Buscar pelo endereço
+                              </button>
+                              <button
+                                type="button"
+                                disabled={ownerGeoBusy}
+                                onClick={handleOwnerLocateByGps}
+                                className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-bold py-1.5 rounded-lg text-[10px] cursor-pointer disabled:opacity-50"
+                              >
+                                📍 Estou no lava-rápido agora
+                              </button>
+                            </div>
+                            <LocationMap point={businessPoint} label={currentBusiness.name} onPick={handleSetBusinessLocation} height={170} />
+                            <p className="text-[10px] text-zinc-500">
+                              {ownerGeoBusy
+                                ? 'Localizando...'
+                                : ownerGeoMsg || (businessPoint
+                                  ? 'Arraste o pino ou toque no mapa para ajustar. Os clientes usam este ponto para calcular a distância do Leva e Traz.'
+                                  : 'Marque onde fica o lava-rápido para os clientes calcularem a distância do Leva e Traz.')}
+                            </p>
+                          </div>
                         </div>
 
                         <button
@@ -1634,30 +1918,95 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
                       </div>
 
                       <div className="flex justify-between items-center text-xs">
-                        <span className="font-bold text-zinc-300">Quadro de Fila do Pátio</span>
-                        <span className="text-[10px] text-emerald-400 font-mono">
-                          {currentBusiness.activeCars.length} veículos em atendimento
-                        </span>
+                        <span className="font-bold text-zinc-300">Pedidos dos Clientes</span>
+                        <button
+                          type="button"
+                          onClick={loadPatioOrders}
+                          className="text-[10px] text-emerald-400 font-bold flex items-center gap-1 cursor-pointer"
+                        >
+                          <RefreshCw className={`w-3 h-3 ${patioLoading ? 'animate-spin' : ''}`} />
+                          Atualizar
+                        </button>
                       </div>
+                      <p className="text-[10px] text-zinc-500 -mt-2">
+                        Toque numa resposta rápida: o WhatsApp abre com a mensagem pronta para o cliente e o pedido muda de etapa.
+                      </p>
 
-                      <div className="space-y-2">
-                        {currentBusiness.activeCars.map((car) => (
-                          <div key={car.id} className="bg-zinc-900/80 border border-zinc-800 p-3 rounded-2xl flex items-center justify-between text-xs">
-                            <div>
-                              <div className="font-bold text-white flex items-center space-x-1.5">
-                                <span>{car.model}</span>
-                                <span className="text-[9px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded font-mono">
-                                  {car.plate}
+                      {(() => {
+                        const active = patioOrders.filter(o => o.status !== 'concluido' && o.status !== 'cancelado');
+                        const done = patioOrders.filter(o => o.status === 'concluido');
+                        const renderOrder = (order: ServiceOrder) => {
+                          const status = (order.status || 'pendente') as OrderStatus;
+                          const services = Array.isArray(order.services) ? order.services.map(s => s.name).join(', ') : '';
+                          const replies = QUICK_REPLIES.filter(r => !r.onlyFor || r.onlyFor.includes(order.fulfillment_type));
+                          const created = order.created_at ? new Date(order.created_at) : null;
+                          return (
+                            <div key={order.id} className="bg-zinc-900/80 border border-zinc-800 p-3 rounded-2xl space-y-2 text-xs">
+                              <div className="flex items-start justify-between gap-2">
+                                <div>
+                                  <div className="font-bold text-white">
+                                    Pedido #{getOrderProtocol(order.id)}
+                                    {order.customer_name ? ` • ${order.customer_name}` : ''}
+                                  </div>
+                                  <div className="text-[10px] text-zinc-400">
+                                    {FULFILLMENT_LABEL[order.fulfillment_type] || order.fulfillment_type}
+                                    {created ? ` • ${created.toLocaleDateString('pt-BR')} ${created.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}` : ''}
+                                  </div>
+                                </div>
+                                <span className={`text-[10px] border px-2 py-1 rounded-lg font-bold shrink-0 ${ORDER_STATUS_STYLE[status]}`}>
+                                  {ORDER_STATUS_LABEL[status]}
                                 </span>
                               </div>
-                              <div className="text-[10px] text-zinc-400">{car.service}</div>
+                              <div className="text-[10px] text-zinc-400 space-y-0.5">
+                                {services && <div>🧽 {services}</div>}
+                                {order.notes && <div>🛣️ {order.notes}</div>}
+                                <div>💰 R$ {Number(order.total_amount || 0).toFixed(2).replace('.', ',')}</div>
+                              </div>
+                              <div className="grid grid-cols-2 gap-1.5">
+                                {replies.map(reply => (
+                                  <button
+                                    key={reply.id}
+                                    type="button"
+                                    onClick={() => handleQuickReply(order, reply)}
+                                    className={`text-left px-2 py-1.5 rounded-lg text-[10px] font-bold cursor-pointer border ${
+                                      reply.status === 'concluido'
+                                        ? 'bg-emerald-500 text-zinc-950 border-emerald-500 hover:bg-emerald-400'
+                                        : 'bg-zinc-800 text-zinc-200 border-zinc-700 hover:bg-zinc-700'
+                                    }`}
+                                  >
+                                    {reply.label}
+                                  </button>
+                                ))}
+                              </div>
+                              {(status === 'pendente' || status === 'confirmado') && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleChangeOrderStatus(order, 'cancelado')}
+                                  className="text-[10px] text-zinc-500 hover:text-zinc-300 cursor-pointer"
+                                >
+                                  Cancelar pedido
+                                </button>
+                              )}
                             </div>
-                            <span className="text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/30 px-2 py-1 rounded-lg font-bold">
-                              {car.stage}
-                            </span>
+                          );
+                        };
+                        return (
+                          <div className="space-y-2">
+                            {active.length === 0 && (
+                              <div className="text-[11px] text-zinc-500 text-center py-6 border border-dashed border-zinc-800 rounded-2xl">
+                                Nenhum pedido em aberto. Os pedidos feitos no app aparecem aqui.
+                              </div>
+                            )}
+                            {active.map(renderOrder)}
+                            {done.length > 0 && (
+                              <>
+                                <div className="text-[10px] font-bold text-zinc-500 pt-2">Prontos ({done.length})</div>
+                                {done.slice(0, 10).map(renderOrder)}
+                              </>
+                            )}
                           </div>
-                        ))}
-                      </div>
+                        );
+                      })()}
                     </div>
                   )}
 
@@ -1998,7 +2347,7 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
                       </div>
                     </div>
                     <span className="text-[10px] font-bold text-emerald-400 font-mono">
-                      R$ {(currentBusiness.valetBaseFee + distanceKm * currentBusiness.valetPerKm).toFixed(2).replace('.', ',')}
+                      {tripFeeLabel(currentBusiness.valetBaseFee, currentBusiness.valetPerKm)}
                     </span>
                   </div>
 
@@ -2032,29 +2381,84 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
                         </div>
                       </div>
                       <span className={`text-[10px] font-bold font-mono ${currentBusiness.hasVip ? 'text-amber-400' : 'text-zinc-600'}`}>
-                        {currentBusiness.hasVip ? `R$ ${(currentBusiness.vipBaseFee + distanceKm * currentBusiness.vipPerKm).toFixed(2).replace('.', ',')}` : 'Bloqueado'}
+                        {currentBusiness.hasVip ? tripFeeLabel(currentBusiness.vipBaseFee, currentBusiness.vipPerKm) : 'Bloqueado'}
                       </span>
                     </div>
                   </div>
 
                 </div>
 
-                {/* SLIDER DE DISTÂNCIA KM */}
+                {/* DISTÂNCIA ATÉ O LAVA-RÁPIDO */}
                 {fulfillmentType !== 'patio' && (
-                  <div className="mt-3 p-3 bg-zinc-900 rounded-xl border border-zinc-800 space-y-1.5">
-                    <div className="flex justify-between items-center text-xs">
-                      <span className="text-zinc-400">Distância do atendimento:</span>
-                      <span className="font-bold text-emerald-400 font-mono">{distanceKm} KM</span>
+                  businessPoint ? (
+                    <div className="mt-3 p-3 bg-zinc-900 rounded-xl border border-zinc-800 space-y-2">
+                      <div className="text-xs text-zinc-300 font-bold">📍 Onde fica o {currentBusiness.name}</div>
+                      <LocationMap point={businessPoint} label={currentBusiness.name} height={150} />
+                      {distanceInfo ? (
+                        <div className="flex items-center justify-between text-xs bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-2.5 py-2">
+                          <span className="text-zinc-200">
+                            O lava-rápido fica a <strong className="text-emerald-400">{formatKm(distanceInfo.km)} km</strong> de você{distanceInfo.byRoad ? ' (pela rua)' : ''}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setDistanceInfo(null)}
+                            className="text-[10px] text-zinc-400 hover:text-white cursor-pointer shrink-0 ml-2"
+                          >
+                            Recalcular
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="space-y-1.5">
+                          <button
+                            type="button"
+                            disabled={clientGeoBusy}
+                            onClick={handleClientDistanceByGps}
+                            className="w-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-2 rounded-lg text-[11px] cursor-pointer disabled:opacity-50"
+                          >
+                            {clientGeoBusy ? 'Calculando...' : '📍 Calcular distância pela minha localização'}
+                          </button>
+                          <div className="flex gap-1.5">
+                            <input
+                              type="text"
+                              placeholder="Ou digite seu endereço / bairro e cidade"
+                              value={clientAddressQuery}
+                              onChange={(e) => setClientAddressQuery(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') handleClientDistanceByAddress(); }}
+                              className="flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-2.5 py-1.5 text-[11px] text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
+                            />
+                            <button
+                              type="button"
+                              disabled={clientGeoBusy}
+                              onClick={handleClientDistanceByAddress}
+                              className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-bold px-3 rounded-lg text-[11px] cursor-pointer disabled:opacity-50"
+                            >
+                              Calcular
+                            </button>
+                          </div>
+                          {clientGeoError && <div className="text-[10px] text-red-400">{clientGeoError}</div>}
+                        </div>
+                      )}
+                      <p className="text-[10px] text-zinc-500">
+                        🔒 Sua localização é usada só neste celular para calcular a distância. Ela não é salva nem enviada ao lava-rápido.
+                      </p>
                     </div>
-                    <input
-                      type="range"
-                      min="1"
-                      max="30"
-                      value={distanceKm}
-                      onChange={(e) => setDistanceKm(Number(e.target.value))}
-                      className="w-full accent-emerald-500 bg-zinc-950 h-1.5 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
+                  ) : (
+                    <div className="mt-3 p-3 bg-zinc-900 rounded-xl border border-zinc-800 space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="text-zinc-400">Distância aproximada:</span>
+                        <span className="font-bold text-emerald-400 font-mono">{distanceKm} KM</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="30"
+                        value={distanceKm}
+                        onChange={(e) => setDistanceKm(Number(e.target.value))}
+                        className="w-full accent-emerald-500 bg-zinc-950 h-1.5 rounded-lg appearance-none cursor-pointer"
+                      />
+                      <p className="text-[10px] text-zinc-500">Este lava-rápido ainda não marcou a localização no mapa.</p>
+                    </div>
+                  )
                 )}
               </div>
 
@@ -2072,7 +2476,7 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
                 </span>
               </div>
               <button
-                onClick={() => setShowModalWhatsApp(true)}
+                onClick={handleFinishWhatsApp}
                 className="w-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-3 rounded-xl transition-all shadow-lg shadow-emerald-500/20 text-xs flex items-center justify-center space-x-2 cursor-pointer"
               >
                 <MessageSquare className="w-4 h-4 fill-current" />
@@ -2147,47 +2551,6 @@ _Ordem gerada pelo aplicativo Jato Splash Car._`;
                 className="w-full py-2.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold rounded-xl text-xs transition-colors shadow-md cursor-pointer"
               >
                 Cadastrar na Equipe Valet
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Modal Captura de WhatsApp Cliente */}
-      {showModalWhatsApp && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-[#161619] border border-zinc-800 rounded-3xl p-5 max-w-sm w-full space-y-4 shadow-2xl relative text-left">
-            <button onClick={() => setShowModalWhatsApp(false)} className="absolute top-4 right-4 text-zinc-400 hover:text-white cursor-pointer">
-              <X className="w-4 h-4" />
-            </button>
-            <h3 className="text-xs font-bold text-white flex items-center space-x-2">
-              <MessageSquare className="w-4 h-4 text-emerald-400" />
-              <span>Confirmar OS com {currentBusiness.name}</span>
-            </h3>
-            <p className="text-[11px] text-zinc-400">
-              Digite seu número para gravarmos o agendamento no Supabase e enviar a confirmação no WhatsApp do prestador:
-            </p>
-            <form onSubmit={handleFinishWhatsApp} className="space-y-3">
-              <input
-                type="text"
-                placeholder="Seu Nome (opcional)"
-                value={customerName}
-                onChange={(e) => setCustomerName(e.target.value)}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
-              />
-              <input
-                type="tel"
-                required
-                placeholder="(15) 99999-9999"
-                value={whatsappPhone}
-                onChange={(e) => setWhatsappPhone(e.target.value)}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
-              />
-              <button
-                type="submit"
-                className="w-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-2.5 rounded-xl text-xs transition-all shadow-md shadow-emerald-500/20 cursor-pointer"
-              >
-                Enviar Orçamento 📲
               </button>
             </form>
           </div>
